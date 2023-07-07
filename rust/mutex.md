@@ -8,6 +8,12 @@
   - [lock](#lock-2)
   - [unlock](#unlock-1)
 - [区别](#区别)
+- [补充std RwLock](#补充std-rwlock)
+  - [write](#write)
+    - [RwLockWriteGuard::Drop](#rwlockwriteguarddrop)
+      - [`wake_writer_or_readers`:](#wake_writer_or_readers)
+  - [read](#read)
+    - [RwLockReadGuard::Drop](#rwlockreadguarddrop)
 
 
 # std
@@ -191,3 +197,68 @@ loop里面尝试修改原子值，spin，再然后
 
 # 区别
 锁的实现都是在用户态自旋再切换到内核态，不同的是tokio返回Pending，parking_log多一层全局HashTable
+
+# 补充std RwLock
+
+```rust
+pub struct RwLock<T: ?Sized> {
+    inner: sys::RwLock,
+    poison: poison::Flag,
+    data: UnsafeCell<T>,
+}
+
+// sys::RwLock
+pub struct RwLock {
+    // The state consists of a 30-bit reader counter, a 'readers waiting' flag, and a 'writers waiting' flag.
+    // Bits 0..30:
+    //   0: Unlocked
+    //   1..=0x3FFF_FFFE: Locked by N readers
+    //   0x3FFF_FFFF: Write locked
+    // Bit 30: Readers are waiting on this futex.
+    // Bit 31: Writers are waiting on the writer_notify futex.
+    state: AtomicU32,
+    // The 'condition variable' to notify writers through.
+    // Incremented on every signal.
+    writer_notify: AtomicU32, // 每次内核唤醒通知都+1，用来传递内核当前值
+}
+```
+* state`Bit 0~29`是读写锁，写满是写锁，否则是读锁（reader数量）
+* `Bit 30` 表示读等待，只有上了写锁或写锁刚释放时会有读等待  
+* `Bit 31` 表示写等待，后面会介绍写优先级高于读
+
+## write
+sys::RwLock:  
+* state==0（没锁） 没有读写等待时立即成功返回
+* spin直到没锁或者有写等待（为公平竞争写锁？）
+* loop
+  * state没锁则尝试写state（Write locked + Bit 31 Writers waiting），return
+  * 以writer_notify地址为ID调用futex_wait，进内核阻塞
+  * spin直到没锁或者有writer等待
+之后返回`RwLockWriteGuard`
+
+### RwLockWriteGuard::Drop
+#### `wake_writer_or_readers`:
+* 只有写等待时（state Bit 31），
+  * state清0
+  * writer_notify+=1
+  * futex_wake(writer_notify地址)，唤醒其它写等待
+* 读写都有等待时（state Bit 30 31），**优先写**
+  * state保持读等待，清掉写等待
+  * writer_notify+=1
+  * futex_wake(writer_notify地址)，唤醒其它写等待
+* 只有读等待 （state Bit 30）
+  * state清0
+  * futex_wake(state)，唤醒所有读等待
+
+## read
+* 上锁（state+=1），条件是is_read_lockable: reader没max，没有写等待，没有读等待（无写有读等待产生在写释放时，此时优先写）
+* spin直到没有写锁或有读等待或有写等待
+* loop
+  * is_read_lockable则上锁
+  * 写`Bit 30`
+  * 以state地址为ID调用futex_wait，进内核阻塞
+* spin直到没有写锁或有读等待或有写等待
+
+### RwLockReadGuard::Drop
+* state-=1  
+* 当最后一个reader释放且有写等待时(state=0，Bit31)：[wake_writer_or_readers](#wake_writer_or_readers)
